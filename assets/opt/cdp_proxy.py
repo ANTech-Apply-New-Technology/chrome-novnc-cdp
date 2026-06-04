@@ -2,6 +2,9 @@ import asyncio
 import logging
 import json
 import os
+import socket
+import time
+import ipaddress
 from urllib.parse import urlparse, urlunparse, parse_qs, quote
 from aiohttp import web, ClientSession, WSMsgType
 
@@ -15,30 +18,87 @@ TARGET_PORT = 9223
 
 TARGET_BASE_URL = f'http://{TARGET_HOST}:{TARGET_PORT}'
 
-# ANTech: optional bearer auth. If CDP_AUTH_TOKEN is set, every non-loopback
-# request to :9222 must present the token (Authorization: Bearer <t> header or
-# ?token=<t> query param). If unset, all requests are allowed (back-compat).
+# ANTech: optional bearer auth. If CDP_AUTH_TOKEN is set, a request to :9222 is
+# authorized when it presents the token (Authorization: Bearer <t> header or
+# ?token=<t> query param).
 CDP_AUTH_TOKEN = os.environ.get('CDP_AUTH_TOKEN', '').strip()
+
+# ANTech: source-IP allowlist. CDP_ALLOWED_CLIENTS is a comma-separated list of
+# hostnames (e.g. "spr-clawbot.railway.internal"). A request whose peer IP
+# resolves to one of these hosts is authorized WITHOUT a token. This is required
+# because OpenClaw's browser tool cannot send the token: it drops the query
+# string when building the /json/version discovery URL (new URL()) and its CDP
+# profile schema rejects custom headers. Railway's private network is per-project
+# isolated, IPv6 ULA, and preserves source IPs with no NAT, so the peer IP is the
+# sibling's real *.railway.internal address — a reliable identity here.
+CDP_ALLOWED_CLIENTS = [
+    h.strip() for h in os.environ.get('CDP_ALLOWED_CLIENTS', '').split(',') if h.strip()
+]
+_ALLOWED_TTL_SEC = 30.0
+_allowed_cache = {'ts': -1e9, 'ips': frozenset()}
 
 # Loopback addresses are exempt from auth so local healthchecks / supervisor work.
 LOOPBACK_ADDRS = ('127.0.0.1', '::1', '::ffff:127.0.0.1')
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-if not CDP_AUTH_TOKEN:
+if not CDP_AUTH_TOKEN and not CDP_ALLOWED_CLIENTS:
     logging.warning(
-        "CDP_AUTH_TOKEN is not set: CDP proxy on :%d is UNAUTHENTICATED. "
-        "Set CDP_AUTH_TOKEN to require a bearer token.", LISTEN_PORT
+        "Neither CDP_AUTH_TOKEN nor CDP_ALLOWED_CLIENTS is set: CDP proxy on :%d "
+        "is UNAUTHENTICATED. Set one to restrict access.", LISTEN_PORT
     )
+else:
+    logging.info(
+        "CDP auth: token=%s, allowed-clients=%s",
+        'on' if CDP_AUTH_TOKEN else 'off',
+        CDP_ALLOWED_CLIENTS or 'none',
+    )
+
+
+def _norm_ip(addr):
+    """Normalize an IP string (strip zone id; canonicalize) for comparison."""
+    if not addr:
+        return addr
+    try:
+        return str(ipaddress.ip_address(addr.split('%', 1)[0]))
+    except ValueError:
+        return addr
+
+
+def _resolve_allowed_ips():
+    """Resolve CDP_ALLOWED_CLIENTS hostnames to a set of normalized IPs.
+
+    Cached for _ALLOWED_TTL_SEC (Railway private IPs are stable but change on a
+    sibling redeploy). On total resolution failure we keep the previous cache so
+    a transient DNS blip doesn't lock out the legitimate client.
+    """
+    if not CDP_ALLOWED_CLIENTS:
+        return frozenset()
+    now = time.monotonic()
+    if now - _allowed_cache['ts'] < _ALLOWED_TTL_SEC:
+        return _allowed_cache['ips']
+    ips = set()
+    for host in CDP_ALLOWED_CLIENTS:
+        try:
+            for info in socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP):
+                ips.add(_norm_ip(info[4][0]))
+        except socket.gaierror as e:
+            logging.warning("CDP_ALLOWED_CLIENTS: could not resolve %s: %s", host, e)
+    if ips:
+        _allowed_cache['ips'] = frozenset(ips)
+    _allowed_cache['ts'] = now
+    return _allowed_cache['ips']
+
+
+def _peer_ip(request):
+    peer = request.transport.get_extra_info('peername') if request.transport else None
+    return _norm_ip(peer[0]) if peer else None
 
 
 def _is_loopback(request):
     """Return True if the request originates from a loopback peer."""
-    peer = request.transport.get_extra_info('peername') if request.transport else None
-    if not peer:
-        return False
-    host = peer[0]
-    return host in LOOPBACK_ADDRS
+    ip = _peer_ip(request)
+    return ip in LOOPBACK_ADDRS if ip else False
 
 
 def _extract_token(request):
@@ -55,12 +115,24 @@ def _extract_token(request):
 
 
 def _is_authorized(request):
-    """Auth gate. Allows all when no token configured; exempts loopback."""
-    if not CDP_AUTH_TOKEN:
+    """Auth gate. A request is authorized if ANY of:
+      - no auth is configured at all (back-compat; warned at boot);
+      - it comes from loopback (local healthchecks / supervisor);
+      - it presents the bearer token (header or ?token=); used by browser-use;
+      - its peer IP is in the resolved CDP_ALLOWED_CLIENTS set; used by OpenClaw,
+        which cannot send a token.
+    """
+    if not CDP_AUTH_TOKEN and not CDP_ALLOWED_CLIENTS:
         return True
     if _is_loopback(request):
         return True
-    return _extract_token(request) == CDP_AUTH_TOKEN
+    if CDP_AUTH_TOKEN and _extract_token(request) == CDP_AUTH_TOKEN:
+        return True
+    if CDP_ALLOWED_CLIENTS:
+        ip = _peer_ip(request)
+        if ip and ip in _resolve_allowed_ips():
+            return True
+    return False
 
 
 def _strip_token_from_raw_query(query):

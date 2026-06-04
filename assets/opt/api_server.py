@@ -3,18 +3,56 @@ import subprocess
 import json
 import os
 import socket
+import time
+import ipaddress
 
-# ANTech: optional bearer auth shared with the CDP proxy. When CDP_AUTH_TOKEN is
-# set, POST /restart-chromium requires Authorization: Bearer <token> (or ?token=)
-# unless the request comes from loopback. GET /health is always unauthenticated.
+# ANTech: auth shared with the CDP proxy. POST /restart-chromium is authorized
+# when the request comes from loopback, presents the bearer token (header or
+# ?token=), OR comes from an IP in CDP_ALLOWED_CLIENTS (resolved sibling hosts).
+# GET /health is always unauthenticated.
 CDP_AUTH_TOKEN = os.environ.get('CDP_AUTH_TOKEN', '').strip()
+CDP_ALLOWED_CLIENTS = [
+    h.strip() for h in os.environ.get('CDP_ALLOWED_CLIENTS', '').split(',') if h.strip()
+]
 LOOPBACK_ADDRS = ('127.0.0.1', '::1', '::ffff:127.0.0.1')
+_ALLOWED_TTL_SEC = 30.0
+_allowed_cache = {'ts': -1e9, 'ips': frozenset()}
+
+
+def _norm_ip(addr):
+    if not addr:
+        return addr
+    try:
+        return str(ipaddress.ip_address(addr.split('%', 1)[0]))
+    except ValueError:
+        return addr
+
+
+def _resolve_allowed_ips():
+    if not CDP_ALLOWED_CLIENTS:
+        return frozenset()
+    now = time.monotonic()
+    if now - _allowed_cache['ts'] < _ALLOWED_TTL_SEC:
+        return _allowed_cache['ips']
+    ips = set()
+    for host in CDP_ALLOWED_CLIENTS:
+        try:
+            for info in socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP):
+                ips.add(_norm_ip(info[4][0]))
+        except socket.gaierror:
+            pass
+    if ips:
+        _allowed_cache['ips'] = frozenset(ips)
+    _allowed_cache['ts'] = now
+    return _allowed_cache['ips']
 
 
 class RequestHandler(BaseHTTPRequestHandler):
+    def _peer_ip(self):
+        return _norm_ip(self.client_address[0]) if self.client_address else None
+
     def _is_loopback(self):
-        # client_address[0] is the peer IP.
-        return self.client_address and self.client_address[0] in LOOPBACK_ADDRS
+        return self._peer_ip() in LOOPBACK_ADDRS
 
     def _extract_token(self):
         auth = self.headers.get('Authorization', '')
@@ -29,12 +67,17 @@ class RequestHandler(BaseHTTPRequestHandler):
         return None
 
     def _is_authorized(self):
-        # Allow all when no token configured (back-compat); exempt loopback.
-        if not CDP_AUTH_TOKEN:
+        if not CDP_AUTH_TOKEN and not CDP_ALLOWED_CLIENTS:
             return True
         if self._is_loopback():
             return True
-        return self._extract_token() == CDP_AUTH_TOKEN
+        if CDP_AUTH_TOKEN and self._extract_token() == CDP_AUTH_TOKEN:
+            return True
+        if CDP_ALLOWED_CLIENTS:
+            ip = self._peer_ip()
+            if ip and ip in _resolve_allowed_ips():
+                return True
+        return False
 
     def _send_json(self, status, payload):
         self.send_response(status)
