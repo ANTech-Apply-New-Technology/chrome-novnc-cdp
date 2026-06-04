@@ -34,6 +34,16 @@ CDP_AUTH_TOKEN = os.environ.get('CDP_AUTH_TOKEN', '').strip()
 CDP_ALLOWED_CLIENTS = [
     h.strip() for h in os.environ.get('CDP_ALLOWED_CLIENTS', '').split(',') if h.strip()
 ]
+
+# ANTech: host:port to advertise in rewritten webSocketDebuggerUrl. Chromium
+# reports ws://localhost:9223/... which a sibling container cannot reach. We
+# normally rewrite the netloc to the request's Host header, but some CDP clients
+# (Playwright's connectOverCDP, used by OpenClaw) issue the /json/version probe
+# without a usable Host header, so the rewrite would fall back to the raw
+# localhost:9223 and the client then connects to its OWN localhost (ECONNREFUSED).
+# CDP_ADVERTISE_HOST makes the rewrite deterministic regardless of the client.
+# e.g. "chrome-openclaw.railway.internal:9222".
+CDP_ADVERTISE_HOST = os.environ.get('CDP_ADVERTISE_HOST', '').strip()
 _ALLOWED_TTL_SEC = 30.0
 _allowed_cache = {'ts': -1e9, 'ips': frozenset()}
 
@@ -209,7 +219,15 @@ async def proxy_http(request):
                 response_headers = dict(resp.headers)
 
                 # /json/version, /json, /json/list の場合、レスポンスを書き換える
-                if request.path in ('/json/version', '/json', '/json/list') and resp.status == 200 and original_host:
+                # ANTech: advertise a deterministic host (CDP_ADVERTISE_HOST) so the
+                # rewrite works even for clients whose probe lacks a Host header;
+                # fall back to the request Host header.
+                advertise_host = CDP_ADVERTISE_HOST or original_host
+                # Normalize a trailing slash: Playwright's connectOverCDP probes
+                # "/json/version/" (with slash), which must be rewritten too — else
+                # the client receives the raw ws://localhost:9223 and connect fails.
+                norm_path = request.path.split('?', 1)[0].rstrip('/') or '/'
+                if norm_path in ('/json/version', '/json', '/json/list') and resp.status == 200 and advertise_host:
                     try:
                         data = json.loads(content)
 
@@ -224,11 +242,11 @@ async def proxy_http(request):
                         for item in items:
                             if 'webSocketDebuggerUrl' in item:
                                 ws_url_parts = urlparse(item['webSocketDebuggerUrl'])
-                                new_ws_url_parts = ws_url_parts._replace(netloc=original_host)
+                                new_ws_url_parts = ws_url_parts._replace(netloc=advertise_host)
                                 if client_token:
                                     new_ws_url_parts = _with_token_query(new_ws_url_parts, client_token)
                                 item['webSocketDebuggerUrl'] = urlunparse(new_ws_url_parts)
-                                logging.info(f"Rewrote webSocketDebuggerUrl for host: {original_host}")
+                                logging.info(f"Rewrote webSocketDebuggerUrl for host: {advertise_host}")
 
                         content = json.dumps(data).encode('utf-8')
                         response_headers['Content-Length'] = str(len(content))
