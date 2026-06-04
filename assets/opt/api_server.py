@@ -14,9 +14,10 @@ CDP_AUTH_TOKEN = os.environ.get('CDP_AUTH_TOKEN', '').strip()
 CDP_ALLOWED_CLIENTS = [
     h.strip() for h in os.environ.get('CDP_ALLOWED_CLIENTS', '').split(',') if h.strip()
 ]
+ALLOW_UNAUTHENTICATED_CDP = os.environ.get('ALLOW_UNAUTHENTICATED_CDP', '').strip().lower() in ('1', 'true', 'yes')
 LOOPBACK_ADDRS = ('127.0.0.1', '::1', '::ffff:127.0.0.1')
 _ALLOWED_TTL_SEC = 30.0
-_allowed_cache = {'ts': -1e9, 'ips': frozenset()}
+_allowed_cache = {'ts': -1e9, 'last_attempt': -1e9, 'ips': frozenset()}
 
 
 def _norm_ip(addr):
@@ -28,12 +29,28 @@ def _norm_ip(addr):
         return addr
 
 
-def _resolve_allowed_ips():
+def _is_loopback_ip(ip):
+    if not ip:
+        return False
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return ip in LOOPBACK_ADDRS
+    mapped = getattr(addr, 'ipv4_mapped', None)
+    if mapped is not None:
+        addr = mapped
+    return addr.is_loopback
+
+
+def _resolve_allowed_ips(force=False):
     if not CDP_ALLOWED_CLIENTS:
         return frozenset()
     now = time.monotonic()
-    if now - _allowed_cache['ts'] < _ALLOWED_TTL_SEC:
+    if not force and (now - _allowed_cache['ts'] < _ALLOWED_TTL_SEC):
         return _allowed_cache['ips']
+    if force and (now - _allowed_cache['last_attempt'] < 3.0):
+        return _allowed_cache['ips']
+    _allowed_cache['last_attempt'] = now
     ips = set()
     for host in CDP_ALLOWED_CLIENTS:
         try:
@@ -43,7 +60,7 @@ def _resolve_allowed_ips():
             pass
     if ips:
         _allowed_cache['ips'] = frozenset(ips)
-    _allowed_cache['ts'] = now
+        _allowed_cache['ts'] = now  # bump freshness only on success
     return _allowed_cache['ips']
 
 
@@ -52,7 +69,26 @@ class RequestHandler(BaseHTTPRequestHandler):
         return _norm_ip(self.client_address[0]) if self.client_address else None
 
     def _is_loopback(self):
-        return self._peer_ip() in LOOPBACK_ADDRS
+        return _is_loopback_ip(self._peer_ip())
+
+    def _peer_allowlisted(self):
+        ip = self._peer_ip()
+        if not ip:
+            return False
+        if ip in _resolve_allowed_ips():
+            return True
+        return ip in _resolve_allowed_ips(force=True)
+
+    def _is_authorized(self):
+        # LOCKDOWN: allowlisted peer IP required when CDP_ALLOWED_CLIENTS is set
+        # (token alone is not sufficient). Loopback always allowed.
+        if self._is_loopback():
+            return True
+        if CDP_ALLOWED_CLIENTS:
+            return self._peer_allowlisted()
+        if CDP_AUTH_TOKEN:
+            return self._extract_token() == CDP_AUTH_TOKEN
+        return ALLOW_UNAUTHENTICATED_CDP
 
     def _extract_token(self):
         auth = self.headers.get('Authorization', '')
@@ -65,19 +101,6 @@ class RequestHandler(BaseHTTPRequestHandler):
             if qs.get('token'):
                 return qs['token'][0]
         return None
-
-    def _is_authorized(self):
-        if not CDP_AUTH_TOKEN and not CDP_ALLOWED_CLIENTS:
-            return True
-        if self._is_loopback():
-            return True
-        if CDP_AUTH_TOKEN and self._extract_token() == CDP_AUTH_TOKEN:
-            return True
-        if CDP_ALLOWED_CLIENTS:
-            ip = self._peer_ip()
-            if ip and ip in _resolve_allowed_ips():
-                return True
-        return False
 
     def _send_json(self, status, payload):
         self.send_response(status)

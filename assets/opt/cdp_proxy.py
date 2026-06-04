@@ -44,8 +44,13 @@ CDP_ALLOWED_CLIENTS = [
 # CDP_ADVERTISE_HOST makes the rewrite deterministic regardless of the client.
 # e.g. "chrome-openclaw.railway.internal:9222".
 CDP_ADVERTISE_HOST = os.environ.get('CDP_ADVERTISE_HOST', '').strip()
+# Fail CLOSED when no auth is configured. Only allow an unauthenticated proxy if
+# this is set true explicitly — prevents an env mistake from silently opening the
+# CDP plane on a locked-down image.
+ALLOW_UNAUTHENTICATED_CDP = os.environ.get('ALLOW_UNAUTHENTICATED_CDP', '').strip().lower() in ('1', 'true', 'yes')
 _ALLOWED_TTL_SEC = 30.0
-_allowed_cache = {'ts': -1e9, 'ips': frozenset()}
+# ts = last SUCCESSFUL resolve; last_attempt = last resolve try (rate-limits forced refresh).
+_allowed_cache = {'ts': -1e9, 'last_attempt': -1e9, 'ips': frozenset()}
 
 # Loopback addresses are exempt from auth so local healthchecks / supervisor work.
 LOOPBACK_ADDRS = ('127.0.0.1', '::1', '::ffff:127.0.0.1')
@@ -55,13 +60,16 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 if not CDP_AUTH_TOKEN and not CDP_ALLOWED_CLIENTS:
     logging.warning(
         "Neither CDP_AUTH_TOKEN nor CDP_ALLOWED_CLIENTS is set: CDP proxy on :%d "
-        "is UNAUTHENTICATED. Set one to restrict access.", LISTEN_PORT
+        "will %s. Set CDP_ALLOWED_CLIENTS to restrict access.",
+        LISTEN_PORT,
+        "allow all (ALLOW_UNAUTHENTICATED_CDP=true)" if ALLOW_UNAUTHENTICATED_CDP
+        else "REJECT all non-loopback requests (fail closed)",
     )
 else:
     logging.info(
-        "CDP auth: token=%s, allowed-clients=%s",
-        'on' if CDP_AUTH_TOKEN else 'off',
+        "CDP auth: allowed-clients=%s (required when set), token=%s",
         CDP_ALLOWED_CLIENTS or 'none',
+        'accepted' if CDP_AUTH_TOKEN else 'off',
     )
 
 
@@ -75,18 +83,23 @@ def _norm_ip(addr):
         return addr
 
 
-def _resolve_allowed_ips():
+def _resolve_allowed_ips(force=False):
     """Resolve CDP_ALLOWED_CLIENTS hostnames to a set of normalized IPs.
 
-    Cached for _ALLOWED_TTL_SEC (Railway private IPs are stable but change on a
-    sibling redeploy). On total resolution failure we keep the previous cache so
-    a transient DNS blip doesn't lock out the legitimate client.
+    Cached for _ALLOWED_TTL_SEC. `force=True` re-resolves immediately (rate-limited
+    to once per 3s) — used on a peer-IP miss so a sibling that just redeployed to a
+    new private IP isn't locked out for the full TTL. `ts` (freshness) is bumped
+    ONLY on a successful resolve, so a run of DNS failures keeps retrying rather
+    than freezing a stale set as "fresh".
     """
     if not CDP_ALLOWED_CLIENTS:
         return frozenset()
     now = time.monotonic()
-    if now - _allowed_cache['ts'] < _ALLOWED_TTL_SEC:
+    if not force and (now - _allowed_cache['ts'] < _ALLOWED_TTL_SEC):
         return _allowed_cache['ips']
+    if force and (now - _allowed_cache['last_attempt'] < 3.0):
+        return _allowed_cache['ips']
+    _allowed_cache['last_attempt'] = now
     ips = set()
     for host in CDP_ALLOWED_CLIENTS:
         try:
@@ -96,7 +109,7 @@ def _resolve_allowed_ips():
             logging.warning("CDP_ALLOWED_CLIENTS: could not resolve %s: %s", host, e)
     if ips:
         _allowed_cache['ips'] = frozenset(ips)
-    _allowed_cache['ts'] = now
+        _allowed_cache['ts'] = now  # bump freshness only on success
     return _allowed_cache['ips']
 
 
@@ -105,10 +118,35 @@ def _peer_ip(request):
     return _norm_ip(peer[0]) if peer else None
 
 
+def _is_loopback_ip(ip):
+    """True for IPv4/IPv6 loopback, including IPv4-mapped (::ffff:127.0.0.1)."""
+    if not ip:
+        return False
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return ip in LOOPBACK_ADDRS
+    mapped = getattr(addr, 'ipv4_mapped', None)
+    if mapped is not None:
+        addr = mapped
+    return addr.is_loopback
+
+
 def _is_loopback(request):
     """Return True if the request originates from a loopback peer."""
+    return _is_loopback_ip(_peer_ip(request))
+
+
+def _peer_allowlisted(request):
+    """True if the peer IP is in the allowlist; re-resolves once on a miss."""
     ip = _peer_ip(request)
-    return ip in LOOPBACK_ADDRS if ip else False
+    if not ip:
+        return False
+    if ip in _resolve_allowed_ips():
+        return True
+    # Miss: the sibling may have just redeployed to a new IP — force one
+    # rate-limited refresh before denying.
+    return ip in _resolve_allowed_ips(force=True)
 
 
 def _extract_token(request):
@@ -125,24 +163,22 @@ def _extract_token(request):
 
 
 def _is_authorized(request):
-    """Auth gate. A request is authorized if ANY of:
-      - no auth is configured at all (back-compat; warned at boot);
-      - it comes from loopback (local healthchecks / supervisor);
-      - it presents the bearer token (header or ?token=); used by browser-use;
-      - its peer IP is in the resolved CDP_ALLOWED_CLIENTS set; used by OpenClaw,
-        which cannot send a token.
+    """Auth gate (loopback always allowed for local healthchecks/supervisor).
+
+    LOCKDOWN: when CDP_ALLOWED_CLIENTS is set, a non-loopback request MUST come
+    from an allowlisted peer IP — a bearer token alone is NOT sufficient (the
+    token is shared across sibling services, so token-only would let any sibling
+    in and weaken "only spr-clawbot"). When no allowlist is configured, fall back
+    to token-only (legacy), and if nothing is configured, fail closed unless
+    ALLOW_UNAUTHENTICATED_CDP=true.
     """
-    if not CDP_AUTH_TOKEN and not CDP_ALLOWED_CLIENTS:
-        return True
     if _is_loopback(request):
         return True
-    if CDP_AUTH_TOKEN and _extract_token(request) == CDP_AUTH_TOKEN:
-        return True
     if CDP_ALLOWED_CLIENTS:
-        ip = _peer_ip(request)
-        if ip and ip in _resolve_allowed_ips():
-            return True
-    return False
+        return _peer_allowlisted(request)
+    if CDP_AUTH_TOKEN:
+        return _extract_token(request) == CDP_AUTH_TOKEN
+    return ALLOW_UNAUTHENTICATED_CDP
 
 
 def _strip_token_from_raw_query(query):
