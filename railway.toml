@@ -1,0 +1,38 @@
+# Railway config for the ANTech chrome-novnc-cdp image.
+# Deployed TWICE in the SPR-clawbot project: "chrome-openclaw" and
+# "chrome-browseruse". Each is remote Chrome exposing CDP + noVNC.
+#
+# Ports:
+#   PORT (auto, PUBLIC)  -> noVNC web UI (websockify). Gets a public Railway
+#                           domain, so it MUST be protected (NOVNC_USER /
+#                           NOVNC_PASSWORD Basic auth + VNC_PASSWORD).
+#   9221 (PRIVATE)       -> api_server.py (POST /restart-chromium, GET /health)
+#   9222 (PRIVATE)       -> cdp_proxy.py  (CDP reverse proxy, bearer-auth'd)
+#   9223 (INTERNAL)      -> Chromium --remote-debugging-port (loopback only)
+#
+# Env vars to set in Railway (per service):
+#   PORT           - auto-injected by Railway (noVNC listen port)
+#   CDP_AUTH_TOKEN - bearer token required on :9222 (CDP) and :9221 (API).
+#                    Pass via Authorization: Bearer <t> header OR ?token=<t>.
+#                    Loopback is exempt. If unset, CDP/API are UNAUTHENTICATED.
+#   VNC_PASSWORD   - x11vnc password (protects the public noVNC stream).
+#   NOVNC_USER     - websockify HTTP Basic auth username (public noVNC).
+#   NOVNC_PASSWORD - websockify HTTP Basic auth password (public noVNC).
+#   VNC_RESOLUTION - e.g. 1280x720 (optional, has a default).
+#   VNC_SHARED     - true/false (optional, has a default).
+#   TZ             - defaults to Europe/Stockholm.
+#
+# Volume: mount a Railway volume at /data so the Chromium profile
+# (--user-data-dir=/data/chromium) persists cookies/logins across deploys.
+
+[build]
+builder = "DOCKERFILE"
+
+[deploy]
+# No HTTP healthcheckPath: the noVNC UI on $PORT returns 401 once Basic auth
+# (--web-auth) is enabled, which would fail an unauthenticated HTTP probe; and
+# the api /health endpoint lives on the private :9221, unreachable by Railway's
+# public probe. So we rely on Railway's default TCP health (port open = up).
+restartPolicyType = "ON_FAILURE"
+# Persist the Chromium profile (cookies/logins) on a volume mounted at /data.
+requiredMountPath = "/data"

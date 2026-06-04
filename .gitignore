@@ -19,4 +19,4 @@ bundles/
 .hg/
 vendor/pkg/
 pyenv
-Vagrantfile
+Vagrantfile__pycache__/

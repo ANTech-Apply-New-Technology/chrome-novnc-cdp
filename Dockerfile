@@ -1,10 +1,10 @@
 FROM debian:13-slim
 
-# Locale
-ENV LANG=ja_JP.UTF-8
-ENV LANGUAGE=ja_JP.UTF-8
-ENV LC_ALL=ja_JP.UTF-8
-ENV TZ="Asia/Tokyo"
+# Locale (ANTech: en_US default + Europe/Stockholm tz for Swedish/EU usage)
+ENV LANG=en_US.UTF-8
+ENV LANGUAGE=en_US.UTF-8
+ENV LC_ALL=en_US.UTF-8
+ENV TZ="Europe/Stockholm"
 
 # VNC Server Title(w/o spaces)
 ENV VNC_TITLE="Chromium"
@@ -35,6 +35,8 @@ RUN apt-get update && \
         libnss3 \
         libasound2 \
         fonts-noto-cjk \
+        fonts-noto-core \
+        fonts-dejavu-core \
         ca-certificates \
         tzdata \
         locales \
@@ -42,8 +44,11 @@ RUN apt-get update && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
-# Install uv and aiohttp
-RUN pip install uv aiohttp --break-system-packages
+# Install uv and aiohttp.
+# ANTech: pin websockify>=0.11 so the BasicHTTPAuth plugin path used by the
+# noVNC HTTP Basic auth layer is guaranteed available (the distro novnc pulls
+# in a websockify, but we install an explicit modern one to be safe).
+RUN pip install uv aiohttp 'websockify>=0.11' --break-system-packages
 
 # Install chromium using playwright via uvx
 RUN uvx playwright install chromium --with-deps --no-shell
@@ -52,8 +57,9 @@ RUN uvx playwright install chromium --with-deps --no-shell
 RUN CHROME_PATH=$(find /root/.cache/ms-playwright/ -type f -name chrome | head -n 1) && \
   ln -s $CHROME_PATH /usr/bin/chromium
 
-# Configure locale
-RUN sed -i 's/^# *\(ja_JP.UTF-8\)/\1/' /etc/locale.gen && \
+# Configure locale (ANTech: enable en_US.UTF-8 and sv_SE.UTF-8)
+RUN sed -i 's/^# *\(en_US.UTF-8\)/\1/' /etc/locale.gen && \
+  sed -i 's/^# *\(sv_SE.UTF-8\)/\1/' /etc/locale.gen && \
   locale-gen
 
 # Configure timezone
