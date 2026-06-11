@@ -19,4 +19,6 @@ bundles/
 .hg/
 vendor/pkg/
 pyenv
-Vagrantfile__pycache__/
+Vagrantfile
+__pycache__/
+*.pyc
