@@ -12,9 +12,24 @@
 #
 # Env vars to set in Railway (per service):
 #   PORT           - auto-injected by Railway (noVNC listen port)
-#   CDP_AUTH_TOKEN - bearer token required on :9222 (CDP) and :9221 (API).
-#                    Pass via Authorization: Bearer <t> header OR ?token=<t>.
-#                    Loopback is exempt. If unset, CDP/API are UNAUTHENTICATED.
+#   CDP_AUTH_TOKEN - bearer token on :9222 (CDP) and :9221 (API). Pass via
+#                    Authorization: Bearer <t> header OR ?token=<t>. Loopback exempt.
+#   CDP_ALLOWED_CLIENTS - comma-separated hostnames (e.g. spr-clawbot.railway.internal)
+#                    whose source IP is authorized WITHOUT a token (how OpenClaw,
+#                    which can't carry the token, is allowed in).
+#   ALLOW_UNAUTHENTICATED_CDP - FAIL-CLOSED by default: if neither CDP_AUTH_TOKEN
+#                    nor CDP_ALLOWED_CLIENTS is set, non-loopback requests are
+#                    REJECTED unless this is explicitly true. (Was previously
+#                    documented as "unset = unauthenticated" — that was wrong.)
+#   CDP_ADVERTISE_HOST - host:port advertised in the rewritten webSocketDebuggerUrl
+#                    (e.g. chrome-openclaw.railway.internal:9222).
+#   CHROME_EXTRA_ARGS - extra Chromium flags (e.g. disable Site Isolation for
+#                    cross-origin iframe booking widgets). Space-separated tokens.
+#   RESIDENTIAL_PROXY_URL - http://user:pass@host:port; routes page egress through
+#                    a residential proxy via the loopback proxy_chain.py forwarder
+#                    (bot-wall escalation lane). Unset = direct egress.
+#                    Tuning: RESIDENTIAL_DAILY_BYTES (default 2GiB),
+#                    PROXY_CHAIN_IDLE_SECONDS (120), PROXY_CHAIN_PORT (8118).
 #   VNC_PASSWORD   - x11vnc password (protects the public noVNC stream).
 #   NOVNC_USER     - websockify HTTP Basic auth username (public noVNC).
 #   NOVNC_PASSWORD - websockify HTTP Basic auth password (public noVNC).
