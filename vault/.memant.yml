@@ -1,0 +1,4 @@
+# Memant node-vault marker. This repo's vault/ latches into the local hub via 'memant sync'.
+name: chrome-novnc-cdp
+namespace: chrome-novnc-cdp        # cross-vault links use [[chrome-novnc-cdp/<page>]]
+shareable: true         # ONLY shareable project knowledge here — it travels with the repo (git)
